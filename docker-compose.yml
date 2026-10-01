@@ -1,0 +1,12 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: pam-backend:latest
+    container_name: pam-backend
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3001:3001"
+    env_file:
+      - .env

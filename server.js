@@ -6,7 +6,7 @@ import jwt from 'jsonwebtoken'
 import mysql from 'mysql2/promise'
 
 const app = express()
-const port = Number(process.env.PORT || 3000)
+const port = Number(process.env.PORT || 3001)
 const jwtSecret = process.env.JWT_SECRET || 'dev-secret-change-me'
 const pool = mysql.createPool({
   host: process.env.DB_HOST || 'localhost',
@@ -30,6 +30,27 @@ app.use((request, response, next) => {
 
 const asyncRoute = (handler) => (request, response, next) => {
   Promise.resolve(handler(request, response, next)).catch(next)
+}
+
+const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds))
+
+const waitForDatabase = async () => {
+  let attempt = 0
+
+  while (true) {
+    try {
+      await pool.query('SELECT 1')
+      if (attempt > 0) {
+        console.log('Conexao com MySQL estabelecida.')
+      }
+      return
+    } catch (error) {
+      attempt += 1
+      console.log(`Aguardando MySQL (tentativa ${attempt})...`)
+      console.error(error.message)
+      await wait(5000)
+    }
+  }
 }
 
 const nextId = async (client, table) => {
@@ -79,6 +100,10 @@ const authenticate = asyncRoute(async (request, response, next) => {
 })
 
 app.get('/api/health', asyncRoute(async (_request, response) => {
+  response.json({ status: 'ok' })
+}))
+
+app.get('/api/health/db', asyncRoute(async (_request, response) => {
   await pool.query('SELECT 1')
   response.json({ status: 'ok', database: 'connected' })
 }))
@@ -260,6 +285,15 @@ app.use((error, _request, response, _next) => {
   response.status(500).json({ error: 'Erro interno do servidor.' })
 })
 
-app.listen(port, () => {
-  console.log(`PAM API rodando em http://localhost:${port}`)
+const start = async () => {
+  await waitForDatabase()
+  app.listen(port, '0.0.0.0', () => {
+    console.log(`PAM API rodando em http://0.0.0.0:${port}`)
+  })
+}
+
+start().catch((error) => {
+  console.error('Falha ao iniciar a API.')
+  console.error(error)
+  process.exit(1)
 })

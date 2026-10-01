@@ -4,7 +4,7 @@ API REST em Node.js para o Project Allocation Manager.
 
 ## Requisitos
 
-- Node.js 18+
+- Node.js 20 LTS+
 - MySQL ou MariaDB
 - Banco criado com `Front-End/banco.sql`
 
@@ -25,11 +25,12 @@ npm install
 npm run dev
 ```
 
-A API ficará disponível em `http://localhost:3000`.
+A API ficará disponível em `http://localhost:3001`.
 
 ## Rotas principais
 
 - `GET /api/health`
+- `GET /api/health/db`
 - `POST /api/auth/register`
 - `POST /api/auth/login`
 - `GET /api/auth/me`
