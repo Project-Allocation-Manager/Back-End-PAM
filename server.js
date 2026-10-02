@@ -34,12 +34,15 @@ const asyncRoute = (handler) => (request, response, next) => {
 
 const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds))
 
+let databaseReady = false
+
 const waitForDatabase = async () => {
   let attempt = 0
 
   while (true) {
     try {
       await pool.query('SELECT 1')
+      databaseReady = true
       if (attempt > 0) {
         console.log('Conexao com MySQL estabelecida.')
       }
@@ -51,6 +54,13 @@ const waitForDatabase = async () => {
       await wait(5000)
     }
   }
+}
+
+const startDatabaseWatch = () => {
+  waitForDatabase().catch((error) => {
+    console.error('Falha ao monitorar MySQL.')
+    console.error(error)
+  })
 }
 
 const nextId = async (client, table) => {
@@ -100,7 +110,7 @@ const authenticate = asyncRoute(async (request, response, next) => {
 })
 
 app.get('/api/health', asyncRoute(async (_request, response) => {
-  response.json({ status: 'ok' })
+  response.json({ status: 'ok', database: databaseReady ? 'ready' : 'starting' })
 }))
 
 app.get('/api/health/db', asyncRoute(async (_request, response) => {
@@ -285,15 +295,8 @@ app.use((error, _request, response, _next) => {
   response.status(500).json({ error: 'Erro interno do servidor.' })
 })
 
-const start = async () => {
-  await waitForDatabase()
-  app.listen(port, '0.0.0.0', () => {
-    console.log(`PAM API rodando em http://0.0.0.0:${port}`)
-  })
-}
-
-start().catch((error) => {
-  console.error('Falha ao iniciar a API.')
-  console.error(error)
-  process.exit(1)
+app.listen(port, '0.0.0.0', () => {
+  console.log(`PAM API rodando em http://0.0.0.0:${port}`)
 })
+
+startDatabaseWatch()
