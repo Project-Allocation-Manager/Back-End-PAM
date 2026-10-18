@@ -10,7 +10,25 @@ const port = Number(process.env.PORT || 3001)
 const jwtSecret = process.env.JWT_SECRET || 'dev-secret-change-me'
 
 
-app.use(cors({ origin: process.env.FRONTEND_URL || 'http://localhost:5173' }))
+// Configure CORS: allow configured FRONTEND_URL and common local dev origins (5173/5174)
+const allowedFrontend = [
+  process.env.FRONTEND_URL,
+  'http://localhost:5173',
+  'http://localhost:5174',
+  'http://127.0.0.1:5173',
+  'http://127.0.0.1:5174',
+].filter(Boolean)
+
+app.use(cors({
+  origin: (origin, callback) => {
+    // allow non-browser tools (curl, server-to-server) which send no origin
+    if (!origin) return callback(null, true)
+    if (allowedFrontend.includes(origin)) return callback(null, true)
+    // For development convenience, also allow any localhost origin if FRONTEND_URL not explicitly set
+    if (!process.env.FRONTEND_URL && /^(https?:)?\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) return callback(null, true)
+    return callback(new Error('CORS origin denied'))
+  }
+}))
 app.use(express.json())
 app.use((request, response, next) => {
   const startedAt = Date.now()
