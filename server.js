@@ -66,6 +66,9 @@ const waitForDatabase = async () => {
   }
 }
 
+// Default weekly capacity in hours (used to compute horas_disponiveis)
+const DEFAULT_WEEKLY_HOURS = 40
+
 const startDatabaseWatch = () => {
   waitForDatabase().catch((error) => {
     console.error('Falha ao monitorar MySQL.')
@@ -204,7 +207,22 @@ app.get('/api/auth/me', authenticate, (request, response) => {
   response.json({ user: publicUser(request.user) })
 })
 
-app.get('/api/funcionarios', authenticate, asyncRoute(async (_request, response) => {
+app.get('/api/funcionarios', authenticate, asyncRoute(async (request, response) => {
+  const { managerId = null, tipo = null, q = null } = request.query
+  const values = []
+  let where = ''
+  if (managerId) { where += ' WHERE (FK_GESTOR_ID = ? OR managerId = ?)'; values.push(managerId, managerId) }
+  if (tipo) {
+    const clause = `TIPO_PERFIL = ?`
+    where += where ? ` AND ${clause}` : ` WHERE ${clause}`
+    values.push(tipo)
+  }
+  if (q) {
+    const clause = `(LOWER(NOME) LIKE ? OR LOWER(EMAIL) LIKE ?)`
+    where += where ? ` AND ${clause}` : ` WHERE ${clause}`
+    const like = `%${String(q).toLowerCase()}%`
+    values.push(like, like)
+  }
   const [rows] = await pool.query(
     `SELECT ID AS id,
             NOME AS name,
@@ -221,7 +239,9 @@ app.get('/api/funcionarios', authenticate, asyncRoute(async (_request, response)
             DATA_CRIACAO AS data_criacao,
             DATA_ATUALIZACAO AS data_atualizacao
      FROM FUNCIONARIO
+     ${where}
      ORDER BY NOME`,
+    values,
   )
   response.json(rows)
 }))
@@ -230,6 +250,18 @@ app.get('/api/funcionarios/:id', authenticate, asyncRoute(async (request, respon
   const [rows] = await pool.query('SELECT ID AS id, NOME AS name, MATRICULA, IDADE, EMAIL, DEPARTAMENTO AS department, CARGO AS role, TIPO_PERFIL AS profileType, GESTOR AS isManager, ATIVO FROM FUNCIONARIO WHERE ID = ?', [request.params.id])
   if (!rows.length) return response.status(404).json({ error: 'Funcionário não encontrado.' })
   response.json({ data: rows[0] })
+}))
+
+// List allocations for a specific funcionario
+app.get('/api/funcionarios/:id/alocacoes', authenticate, asyncRoute(async (request, response) => {
+  const userId = request.params.id
+  const [rows] = await pool.query(
+    `SELECT a.ID as id, a.PROJETO_ID as projectId, p.NOME as projectName, a.USUARIO_ID as userId, a.DURACAO_ALOCACAO as duracao_alocacao, a.PERCENTUAL_ALOCACAO as percentual_alocacao, a.DATA_INICIO as data_inicio, a.DATA_FIM as data_fim
+     FROM ALOCACOES_PROJETO a JOIN PROJETOS p ON p.ID = a.PROJETO_ID
+     WHERE a.USUARIO_ID = ? ORDER BY a.DATA_INICIO DESC`,
+    [userId]
+  )
+  response.json({ data: rows })
 }))
 
 app.post('/api/funcionarios', authenticate, asyncRoute(async (request, response) => {
@@ -278,12 +310,24 @@ app.get('/api/funcionarios/:id/disponibilidade', authenticate, asyncRoute(async 
   let where = 'WHERE USUARIO_ID = ?'
   if (startDate) { values.push(startDate); where += ' AND (DATA_FIM IS NULL OR DATA_FIM >= ?)'}
   if (endDate) { values.push(endDate); where += ' AND DATA_INICIO <= ?'}
-  const [rows] = await pool.query(`SELECT COALESCE(SUM(PERCENTUAL_ALOCACAO),0) as total FROM ALOCACOES_PROJETO ${where}`, values)
-  const total = Number(rows[0].total || 0)
-  response.json({ data: { total_percentual: total, disponivel: Math.max(0, 100 - total) } })
+  // Sum percentual and duration (hours) for accuracy
+  const [rows] = await pool.query(`SELECT COALESCE(SUM(PERCENTUAL_ALOCACAO),0) as total_percentual, COALESCE(SUM(DURACAO_ALOCACAO),0) as total_horas FROM ALOCACOES_PROJETO ${where}`, values)
+  const totalPercent = Number(rows[0].total_percentual || 0)
+  const totalHoras = Number(rows[0].total_horas || 0)
+  const percentDisponivel = Math.max(0, 100 - totalPercent)
+  const horasDisponiveis = Math.max(0, DEFAULT_WEEKLY_HOURS - totalHoras)
+  response.json({ data: { total_percentual: totalPercent, disponivel: percentDisponivel, total_horas_alocadas: totalHoras, horas_disponiveis: horasDisponiveis } })
 }))
 
-app.get('/api/projetos', authenticate, asyncRoute(async (_request, response) => {
+app.get('/api/projetos', authenticate, asyncRoute(async (request, response) => {
+  const user = request.user || {}
+  const values = []
+  let where = ''
+  // If the requester is a manager (gestor), limit projects to those managed by them
+  if (user.isManager || user.profileType === 'gestor') {
+    where = 'WHERE p.GESTOR_ID = ?'
+    values.push(user.id)
+  }
   const [rows] = await pool.query(
     `SELECT p.ID AS id,
             p.NOME AS name,
@@ -296,12 +340,34 @@ app.get('/api/projetos', authenticate, asyncRoute(async (_request, response) => 
             p.DATA_ESTIMADA_FIM AS estimatedEndDate,
             p.DATA_FIM AS endDate,
             p.ORCAMENTO AS budget,
-            p.PROGRESSO AS progress,
+            -- Compute progress: prefer non-zero stored PROGRESSO, otherwise derive from milestones (marcos)
+            COALESCE(NULLIF(p.PROGRESSO,0), CASE WHEN COALESCE(m.total_entregas,0) > 0 THEN ROUND((COALESCE(m.completed_entregas,0) / COALESCE(m.total_entregas,0)) * 100) ELSE 0 END) AS progress,
             p.ATIVO AS active,
             p.DATA_CRIACAO AS data_criacao,
-            p.DATA_ATUALIZACAO AS data_atualizacao
-     FROM PROJETOS p LEFT JOIN FUNCIONARIO f ON f.ID = p.GESTOR_ID
+            p.DATA_ATUALIZACAO AS data_atualizacao,
+            COALESCE(a.allocated_count, 0) as allocated_count,
+            COALESCE(a.total_percentual, 0) as total_percentual_alocado,
+            COALESCE(a.total_horas, 0) as total_horas_alocado
+     FROM PROJETOS p
+     LEFT JOIN FUNCIONARIO f ON f.ID = p.GESTOR_ID
+     LEFT JOIN (
+       SELECT PROJETO_ID, COUNT(*) as allocated_count, COALESCE(SUM(PERCENTUAL_ALOCACAO),0) as total_percentual, COALESCE(SUM(DURACAO_ALOCACAO),0) as total_horas
+       FROM ALOCACOES_PROJETO
+       WHERE (DATA_FIM IS NULL OR DATA_FIM >= CURDATE())
+       GROUP BY PROJETO_ID
+     ) a ON a.PROJETO_ID = p.ID
+     LEFT JOIN (
+       -- derive totals from entregas (preferred) grouped by projeto
+       SELECT m.PROJETO_ID,
+              COALESCE(COUNT(e.ID),0) as total_entregas,
+              COALESCE(SUM(CASE WHEN (e.STATUS IS NOT NULL AND LOWER(e.STATUS) <> 'pendente') OR e.DATA_ENTREGA IS NOT NULL THEN 1 ELSE 0 END),0) as completed_entregas
+       FROM MARCO m
+       LEFT JOIN ENTREGA e ON e.MARCO_ID = m.ID
+       GROUP BY m.PROJETO_ID
+     ) m ON m.PROJETO_ID = p.ID
+     ${where}
      ORDER BY p.DATA_CRIACAO DESC`,
+    values
   )
   // Return rows with consistent camelCase keys expected by frontend
   response.json(rows)
@@ -343,7 +409,25 @@ app.get('/api/projetos/:projectId/alocacoes', authenticate, asyncRoute(async (re
 
 // Get project by id
 app.get('/api/projetos/:projectId', authenticate, asyncRoute(async (request, response) => {
-  const [rows] = await pool.query(`SELECT ID AS id, NOME AS name, CATEGORIA AS category, DESCRICAO AS description, STATUS AS status, GESTOR_ID AS managerId, DATA_INICIO AS startDate, DATA_ESTIMADA_FIM AS estimatedEndDate, DATA_FIM AS endDate, ORCAMENTO AS budget, PROGRESSO AS progress, ATIVO AS active, DATA_CRIACAO AS data_criacao, DATA_ATUALIZACAO AS data_atualizacao FROM PROJETOS WHERE ID = ?`, [request.params.projectId])
+  const projectId = request.params.projectId
+  const [rows] = await pool.query(
+    `SELECT p.ID AS id, p.NOME AS name, p.CATEGORIA AS category, p.DESCRICAO AS description, p.STATUS AS status, p.GESTOR_ID AS managerId,
+            p.DATA_INICIO AS startDate, p.DATA_ESTIMADA_FIM AS estimatedEndDate, p.DATA_FIM AS endDate, p.ORCAMENTO AS budget,
+            COALESCE(NULLIF(p.PROGRESSO,0), CASE WHEN COALESCE(m.total_entregas,0) > 0 THEN ROUND((COALESCE(m.completed_entregas,0) / COALESCE(m.total_entregas,0)) * 100) ELSE 0 END) AS progress,
+            p.ATIVO AS active, p.DATA_CRIACAO AS data_criacao, p.DATA_ATUALIZACAO AS data_atualizacao
+     FROM PROJETOS p
+     LEFT JOIN (
+       SELECT m.PROJETO_ID,
+              COALESCE(COUNT(e.ID),0) as total_entregas,
+              COALESCE(SUM(CASE WHEN (e.STATUS IS NOT NULL AND LOWER(e.STATUS) <> 'pendente') OR e.DATA_ENTREGA IS NOT NULL THEN 1 ELSE 0 END),0) as completed_entregas
+       FROM MARCO m
+       LEFT JOIN ENTREGA e ON e.MARCO_ID = m.ID
+       WHERE m.PROJETO_ID = ?
+       GROUP BY m.PROJETO_ID
+     ) m ON m.PROJETO_ID = p.ID
+     WHERE p.ID = ?`,
+    [projectId, projectId]
+  )
   if (!rows.length) return response.status(404).json({ error: 'Projeto não encontrado.' })
   response.json({ data: rows[0] })
 }))
@@ -390,18 +474,19 @@ app.get('/api/projetos/:projectId/resumo', authenticate, asyncRoute(async (reque
 }))
 
 app.post('/api/projetos/:projectId/alocacoes', authenticate, authorize(['admin','gestor']), asyncRoute(async (request, response) => {
-  const { userId, duration, startDate, endDate = null } = request.body
-  if (!userId || duration === undefined || !startDate) {
-    return response.status(400).json({ error: 'userId, duration e startDate são obrigatórios.' })
+  const { userId, duration = null, percentual_alocacao = null, startDate, endDate = null } = request.body
+  // require userId and startDate and either duration or percentual_alocacao
+  if (!userId || !startDate || (duration === null && percentual_alocacao === null)) {
+    return response.status(400).json({ error: 'userId, startDate e (duration ou percentual_alocacao) são obrigatórios.' })
   }
 
   const client = await pool.getConnection()
   try {
     const id = await nextId(client, 'ALOCACOES_PROJETO')
     await client.query(
-      `INSERT INTO ALOCACOES_PROJETO (ID, PROJETO_ID, USUARIO_ID, DURACAO_ALOCACAO, DATA_INICIO, DATA_FIM)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-      [id, request.params.projectId, userId, duration, startDate, endDate],
+      `INSERT INTO ALOCACOES_PROJETO (ID, PROJETO_ID, USUARIO_ID, DURACAO_ALOCACAO, PERCENTUAL_ALOCACAO, DATA_INICIO, DATA_FIM)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [id, request.params.projectId, userId, duration, percentual_alocacao, startDate, endDate],
     )
     const [rows] = await client.query('SELECT * FROM ALOCACOES_PROJETO WHERE ID = ?', [id])
     response.status(201).json(rows[0])
@@ -448,9 +533,13 @@ app.get('/api/alocacoes/disponibilidade', authenticate, asyncRoute(async (reques
     values.push(endDate)
     where += ' AND DATA_INICIO <= ?'
   }
-  const [rows] = await pool.query(`SELECT COALESCE(SUM(PERCENTUAL_ALOCACAO),0) as total FROM ALOCACOES_PROJETO ${where}`, values)
-  const total = Number(rows[0].total || 0)
-  response.json({ data: { total_percentual: total, disponivel: Math.max(0, 100 - total) } })
+  // Sum percentual and duration (hours) to return both percent and hours availability
+  const [rows] = await pool.query(`SELECT COALESCE(SUM(PERCENTUAL_ALOCACAO),0) as total_percentual, COALESCE(SUM(DURACAO_ALOCACAO),0) as total_horas FROM ALOCACOES_PROJETO ${where}`, values)
+  const totalPercent = Number(rows[0].total_percentual || 0)
+  const totalHoras = Number(rows[0].total_horas || 0)
+  const percentDisponivel = Math.max(0, 100 - totalPercent)
+  const horasDisponiveis = Math.max(0, DEFAULT_WEEKLY_HOURS - totalHoras)
+  response.json({ data: { total_percentual: totalPercent, disponivel: percentDisponivel, total_horas_alocadas: totalHoras, horas_disponiveis: horasDisponiveis } })
 }))
 
 // Empréstimo de alocação
@@ -577,7 +666,19 @@ app.patch('/api/solicitacoes/:id/reprovar', authenticate, authorize(['admin','ge
 
 // Marcos
 app.get('/api/projetos/:projectId/marcos', authenticate, asyncRoute(async (request, response) => {
-  const [rows] = await pool.query('SELECT * FROM MARCO WHERE PROJETO_ID = ? ORDER BY DATA_VENCIMENTO', [request.params.projectId])
+  // Return milestones with aggregated entregas counts (total and completed) so frontend can compute progress reliably
+  const projectId = request.params.projectId
+  const [rows] = await pool.query(
+    `SELECT m.ID AS ID, m.TITULO AS TITULO, m.DESCRICAO AS DESCRICAO, m.DATA_VENCIMENTO AS DATA_VENCIMENTO, m.STATUS AS STATUS,
+            COALESCE(COUNT(e.ID),0) AS TOTAL_ENTREGAS,
+            COALESCE(SUM(CASE WHEN (e.STATUS IS NOT NULL AND LOWER(e.STATUS) <> 'pendente') OR e.DATA_ENTREGA IS NOT NULL THEN 1 ELSE 0 END),0) AS CONCLUIDAS
+     FROM MARCO m
+     LEFT JOIN ENTREGA e ON e.MARCO_ID = m.ID
+     WHERE m.PROJETO_ID = ?
+     GROUP BY m.ID
+     ORDER BY m.DATA_VENCIMENTO`,
+    [projectId]
+  )
   response.json({ data: rows })
 }))
 
@@ -658,38 +759,125 @@ app.delete('/api/entregas/:id', authenticate, asyncRoute(async (request, respons
 }))
 
 // Dashboard admin endpoints (basic aggregations)
-app.get('/api/dashboard/admin', authenticate, authorize(['admin']), asyncRoute(async (request, response) => {
+// Allow both 'admin' and 'gestor' to access dashboard metrics
+app.get('/api/dashboard/admin', authenticate, authorize(['admin','gestor']), asyncRoute(async (request, response) => {
   const [kpis] = await pool.query(`SELECT (SELECT COUNT(*) FROM PROJETOS) as total_projetos, (SELECT COUNT(*) FROM FUNCIONARIO WHERE ATIVO = 1) as total_usuarios, (SELECT COALESCE(SUM(DURACAO_MINUTOS),0) FROM LANCAMENTOS_HORAS WHERE STATUS = 'aprovado') as total_minutos`)
   response.json({ data: kpis[0] })
 }))
 
-app.get('/api/dashboard/admin/kpis', authenticate, authorize(['admin']), asyncRoute(async (request, response) => {
-  const [rows] = await pool.query(`SELECT (SELECT COUNT(*) FROM PROJETOS) as total_projetos, (SELECT COUNT(*) FROM FUNCIONARIO WHERE ATIVO = 1) as total_usuarios, (SELECT COALESCE(SUM(DURACAO_MINUTOS),0) FROM LANCAMENTOS_HORAS WHERE STATUS = 'aprovado') as total_minutos, (SELECT COUNT(*) FROM SOLITICACAO WHERE STATUS = 'pendente') as solicitacoes_pendentes`)
-  response.json({ data: rows[0] })
+app.get('/api/dashboard/admin/kpis', authenticate, authorize(['admin','gestor']), asyncRoute(async (request, response) => {
+  // Provide KPIs tailored for admins and managers (gestores).
+  const user = request.user || {}
+  // Default global KPIs
+  const [[global]] = await pool.query(`SELECT (SELECT COUNT(*) FROM PROJETOS) as total_projetos`)
+  let kpis = { total_projetos: global.total_projetos || 0, total_usuarios: 0, total_minutos: 0, solicitacoes_pendentes: 0, recursos_sem_apontamentos: 0, recursos_desalocados: 0 }
+
+  if (user.isManager || user.profileType === 'gestor') {
+    // Manager-specific KPIs: compute counts within the manager's team
+    const managerId = user.id
+    // Show only registered resources (exclude gestores/admins) — not counting the gestor
+    const [[countRes]] = await pool.query("SELECT COUNT(*) as c FROM FUNCIONARIO WHERE (TIPO_PERFIL = 'recurso' OR TIPO_PERFIL = 'colaborador') AND ATIVO = 1")
+    kpis.total_usuarios = Number(countRes.c || 0)
+
+    // solicitações de horas extras for team
+    const [solRows] = await pool.query('SELECT COUNT(*) as c FROM SOLITICACAO s WHERE s.TIPO = ? AND s.USUARIO_ID IN (SELECT ID FROM FUNCIONARIO WHERE FK_GESTOR_ID = ?)', ['hora_extra', managerId])
+    kpis.solicitacoes_pendentes = Number(solRows[0].c || 0)
+
+    // total minutos (aprovados) for team's lancamentos
+    const [minRows] = await pool.query('SELECT COALESCE(SUM(l.DURACAO_MINUTOS),0) as m FROM LANCAMENTOS_HORAS l WHERE l.USUARIO_ID IN (SELECT ID FROM FUNCIONARIO WHERE FK_GESTOR_ID = ?) ', [managerId])
+    kpis.total_minutos = Number(minRows[0].m || 0)
+
+    // recursos sem apontamentos this week (Monday..Sunday)
+    const today = new Date()
+    const day = today.getDay()
+    const offsetFromMonday = (day + 6) % 7
+    const monday = new Date(today)
+    monday.setDate(today.getDate() - offsetFromMonday)
+    monday.setHours(0,0,0,0)
+    const sunday = new Date(monday.getTime() + 6 * 24 * 60 * 60 * 1000)
+    const startDate = monday.toISOString().slice(0,10)
+    const endDate = sunday.toISOString().slice(0,10)
+
+    // Count team resources (TIPO_PERFIL = 'recurso') that have NO weekday (Mon-Fri)
+    // lancamentos in the interval [startDate, endDate]. Saturday/Sunday do not count
+    const [noRows] = await pool.query(
+      `SELECT COUNT(*) as c FROM FUNCIONARIO f
+       WHERE f.FK_GESTOR_ID = ? AND f.ATIVO = 1 AND (f.TIPO_PERFIL = 'recurso' OR f.TIPO_PERFIL IS NULL)
+       AND NOT EXISTS (
+         SELECT 1 FROM LANCAMENTOS_HORAS l
+         WHERE l.USUARIO_ID = f.ID
+           AND l.DATA_LANCAMENTO BETWEEN ? AND ?
+           AND DAYOFWEEK(l.DATA_LANCAMENTO) BETWEEN 2 AND 6
+       )`,
+      [managerId, startDate, endDate]
+    )
+    kpis.recursos_sem_apontamentos = Number(noRows[0].c || 0)
+
+    // recursos desalocados: team members without active allocations
+    const [desRows] = await pool.query(
+      `SELECT COUNT(*) as c FROM FUNCIONARIO f
+       WHERE f.FK_GESTOR_ID = ? AND f.ATIVO = 1
+       AND NOT EXISTS (SELECT 1 FROM ALOCACOES_PROJETO a WHERE a.USUARIO_ID = f.ID AND (a.DATA_FIM IS NULL OR a.DATA_FIM >= CURDATE()))`,
+      [managerId]
+    )
+    kpis.recursos_desalocados = Number(desRows[0].c || 0)
+
+    return response.json({ data: kpis })
+  }
+
+  // Admin/global KPIs
+  const [rows] = await pool.query(`SELECT (SELECT COUNT(*) FROM PROJETOS) as total_projetos, (SELECT COUNT(*) FROM FUNCIONARIO WHERE ATIVO = 1) as total_usuarios, (SELECT COALESCE(SUM(DURACAO_MINUTOS),0) FROM LANCAMENTOS_HORAS WHERE STATUS = 'aprovado') as total_minutos, (SELECT COUNT(*) FROM SOLITICACAO WHERE TIPO = 'hora_extra') as solicitacoes_pendentes`)
+  const r = rows[0]
+  kpis.total_projetos = r.total_projetos || 0
+  kpis.total_usuarios = r.total_usuarios || 0
+  kpis.total_minutos = r.total_minutos || 0
+  kpis.solicitacoes_pendentes = r.solicitacoes_pendentes || 0
+  response.json({ data: kpis })
 }))
 
-app.get('/api/dashboard/admin/horas-por-projeto', authenticate, authorize(['admin']), asyncRoute(async (request, response) => {
+app.get('/api/dashboard/admin/horas-por-projeto', authenticate, authorize(['admin','gestor']), asyncRoute(async (request, response) => {
   const { startDate, endDate } = request.query
   const values = []
+  // By default include only approved lancamentos
   let where = 'WHERE l.STATUS = "aprovado"'
   if (startDate) { where += ' AND l.DATA_LANCAMENTO >= ?'; values.push(startDate) }
   if (endDate) { where += ' AND l.DATA_LANCAMENTO <= ?'; values.push(endDate) }
+  // If requester is a manager, limit projects to those managed by them
+  const user = request.user || {}
+  if (user.isManager || user.profileType === 'gestor') {
+    where += ' AND p.GESTOR_ID = ?'
+    values.push(user.id)
+  }
   const [rows] = await pool.query(`SELECT p.ID as projectId, p.NOME as projectName, COALESCE(SUM(l.DURACAO_MINUTOS),0) as minutos FROM PROJETOS p LEFT JOIN LANCAMENTOS_HORAS l ON l.PROJETO_ID = p.ID ${where} GROUP BY p.ID, p.NOME ORDER BY minutos DESC`, values)
   response.json({ data: rows })
 }))
 
-app.get('/api/dashboard/admin/horas-por-recurso', authenticate, authorize(['admin']), asyncRoute(async (request, response) => {
+app.get('/api/dashboard/admin/horas-por-recurso', authenticate, authorize(['admin','gestor']), asyncRoute(async (request, response) => {
   const { startDate, endDate } = request.query
   const values = []
   let where = 'WHERE l.STATUS = "aprovado"'
   if (startDate) { where += ' AND l.DATA_LANCAMENTO >= ?'; values.push(startDate) }
   if (endDate) { where += ' AND l.DATA_LANCAMENTO <= ?'; values.push(endDate) }
+  // If requester is a manager, restrict to team members only
+  const user = request.user || {}
+  if (user.isManager || user.profileType === 'gestor') {
+    where += ' AND f.FK_GESTOR_ID = ?'
+    values.push(user.id)
+  }
   const [rows] = await pool.query(`SELECT f.ID as userId, f.NOME as userName, COALESCE(SUM(l.DURACAO_MINUTOS),0) as minutos FROM FUNCIONARIO f LEFT JOIN LANCAMENTOS_HORAS l ON l.USUARIO_ID = f.ID ${where} GROUP BY f.ID, f.NOME ORDER BY minutos DESC`, values)
   response.json({ data: rows })
 }))
 
-app.get('/api/dashboard/admin/horas-extras', authenticate, authorize(['admin']), asyncRoute(async (request, response) => {
-  const [rows] = await pool.query("SELECT s.ID, s.USUARIO_ID, f.NOME as usuario_nome, s.HORAS, s.STATUS, s.DATA_CRIACAO FROM SOLITICACAO s JOIN FUNCIONARIO f ON f.ID = s.USUARIO_ID WHERE s.TIPO = 'hora_extra' ORDER BY s.DATA_CRIACAO DESC")
+app.get('/api/dashboard/admin/horas-extras', authenticate, authorize(['admin','gestor']), asyncRoute(async (request, response) => {
+  const user = request.user || {}
+  const values = ['hora_extra']
+  let where = 'WHERE s.TIPO = ?'
+  // If manager, show only team's extras
+  if (user.isManager || user.profileType === 'gestor') {
+    where += ' AND s.USUARIO_ID IN (SELECT ID FROM FUNCIONARIO WHERE FK_GESTOR_ID = ?)'
+    values.push(user.id)
+  }
+  const [rows] = await pool.query(`SELECT s.ID, s.USUARIO_ID, f.NOME as usuario_nome, s.HORAS, s.STATUS, s.DATA_CRIACAO FROM SOLITICACAO s JOIN FUNCIONARIO f ON f.ID = s.USUARIO_ID ${where} ORDER BY s.DATA_CRIACAO DESC`, values)
   response.json({ data: rows })
 }))
 
@@ -711,26 +899,86 @@ app.get('/api/dashboard/admin/burndown', authenticate, asyncRoute(async (request
 }))
 
 app.get('/api/dashboard/admin/distribuicao-recursos', authenticate, asyncRoute(async (request, response) => {
-  const [rows] = await pool.query(`SELECT p.ID as projectId, p.NOME as projectName, COALESCE(SUM(a.PERCENTUAL_ALOCACAO),0) as total_percentual FROM PROJETOS p LEFT JOIN ALOCACOES_PROJETO a ON a.PROJETO_ID = p.ID GROUP BY p.ID, p.NOME ORDER BY total_percentual DESC`)
+  const user = request.user || {}
+  const values = []
+  let where = ''
+  if (user.isManager || user.profileType === 'gestor') {
+    where = 'WHERE p.GESTOR_ID = ?'
+    values.push(user.id)
+  }
+  const [rows] = await pool.query(`SELECT p.ID as projectId, p.NOME as projectName, COALESCE(SUM(a.PERCENTUAL_ALOCACAO),0) as total_percentual FROM PROJETOS p LEFT JOIN ALOCACOES_PROJETO a ON a.PROJETO_ID = p.ID ${where} GROUP BY p.ID, p.NOME ORDER BY total_percentual DESC`, values)
   response.json({ data: rows })
 }))
 
 // Heatmap: hours per resource per day in a date range (defaults to last 7 days)
-app.get('/api/dashboard/admin/heatmap', authenticate, asyncRoute(async (request, response) => {
+app.get('/api/dashboard/admin/heatmap', authenticate, authorize(['admin','gestor']), asyncRoute(async (request, response) => {
   const { startDate, endDate } = request.query
   // default to last 7 days
   const end = endDate || new Date().toISOString().slice(0,10)
   const start = startDate || new Date(Date.now() - 6 * 24 * 60 * 60 * 1000).toISOString().slice(0,10)
 
+  // Include all lancamentos in the heatmap (not only approved) so admin/gestor
+  // can inspect all pointed hours. If a filter on approval is required later,
+  // we can add a query param to restrict by status.
+  // Return date as YYYY-MM-DD string to avoid timezone/JS Date shifting on the frontend
+  // If requester is a manager, limit to team members
+  const user = request.user || {}
+  const values = [start, end]
+  let joinFilter = ''
+  if (user.isManager || user.profileType === 'gestor') {
+    joinFilter = ' WHERE f.FK_GESTOR_ID = ?'
+    values.push(user.id)
+  }
+
   const [rows] = await pool.query(
-    `SELECT f.ID as userId, f.NOME as userName, DATE(l.DATA_LANCAMENTO) as date, COALESCE(SUM(l.DURACAO_MINUTOS),0) as minutos
+    `SELECT f.ID as userId, f.NOME as userName, DATE_FORMAT(l.DATA_LANCAMENTO, '%Y-%m-%d') as date, COALESCE(SUM(l.DURACAO_MINUTOS),0) as minutos
      FROM FUNCIONARIO f
-     LEFT JOIN LANCAMENTOS_HORAS l ON l.USUARIO_ID = f.ID AND l.STATUS = 'aprovado' AND l.DATA_LANCAMENTO BETWEEN ? AND ?
-     GROUP BY f.ID, DATE(l.DATA_LANCAMENTO)
-     ORDER BY f.NOME, DATE(l.DATA_LANCAMENTO)`,
-    [start, end],
+     LEFT JOIN LANCAMENTOS_HORAS l ON l.USUARIO_ID = f.ID AND l.DATA_LANCAMENTO BETWEEN ? AND ?
+     ${joinFilter}
+     GROUP BY f.ID, DATE_FORMAT(l.DATA_LANCAMENTO, '%Y-%m-%d')
+     ORDER BY f.NOME, DATE_FORMAT(l.DATA_LANCAMENTO, '%Y-%m-%d')`,
+    values,
   )
   response.json({ data: rows })
+}))
+
+// Detailed validator: list team resources with weekday minutes in the interval
+app.get('/api/dashboard/admin/sem-apontamentos', authenticate, authorize(['admin','gestor']), asyncRoute(async (request, response) => {
+  const user = request.user || {}
+  const managerId = user.id
+  const { startDate, endDate } = request.query
+  if (!startDate || !endDate) return response.status(400).json({ error: 'startDate and endDate are required in YYYY-MM-DD' })
+
+  const [rows] = await pool.query(
+    `SELECT f.ID as userId, f.NOME as userName, COALESCE(SUM(CASE WHEN DAYOFWEEK(l.DATA_LANCAMENTO) BETWEEN 2 AND 6 THEN l.DURACAO_MINUTOS ELSE 0 END),0) as minutos_weekdays, MAX(CASE WHEN DAYOFWEEK(l.DATA_LANCAMENTO) BETWEEN 2 AND 6 THEN l.DATA_LANCAMENTO ELSE NULL END) as last_weekday
+     FROM FUNCIONARIO f
+     LEFT JOIN LANCAMENTOS_HORAS l ON l.USUARIO_ID = f.ID AND l.DATA_LANCAMENTO BETWEEN ? AND ?
+     WHERE f.FK_GESTOR_ID = ? AND f.ATIVO = 1 AND (f.TIPO_PERFIL = 'recurso' OR f.TIPO_PERFIL IS NULL)
+     GROUP BY f.ID, f.NOME
+     ORDER BY f.NOME`,
+    [startDate, endDate, managerId]
+  )
+
+  // return rows with flag indicating no weekday minutes
+  const result = rows.map(r => ({ userId: r.userId, userName: r.userName, minutos_weekdays: Number(r.minutos_weekdays||0), last_weekday: r.last_weekday, no_weekday_points: Number(r.minutos_weekdays||0) === 0 }))
+  response.json({ data: result })
+}))
+
+// Submit week for approval: mark user's lancamentos in a date range as 'pendente'
+app.post('/api/lancamentos/submit-week', authenticate, asyncRoute(async (request, response) => {
+  const { startDate, endDate } = request.body
+  if (!startDate || !endDate) return response.status(400).json({ error: 'startDate e endDate são obrigatórios.' })
+  const [result] = await pool.query('UPDATE LANCAMENTOS_HORAS SET STATUS = ? WHERE USUARIO_ID = ? AND DATA_LANCAMENTO BETWEEN ? AND ?', ['pendente', request.user.id, startDate, endDate])
+  // result.affectedRows may contain number of updated rows
+  response.json({ data: { updated: result.affectedRows || 0 } })
+}))
+
+// Approve week: managers/admins can approve all lancamentos for a user in a date range
+app.post('/api/lancamentos/approve-week', authenticate, authorize(['admin','gestor']), asyncRoute(async (request, response) => {
+  const { userId, startDate, endDate } = request.body
+  if (!userId || !startDate || !endDate) return response.status(400).json({ error: 'userId, startDate e endDate são obrigatórios.' })
+  const [result] = await pool.query('UPDATE LANCAMENTOS_HORAS SET STATUS = ? WHERE USUARIO_ID = ? AND DATA_LANCAMENTO BETWEEN ? AND ?', ['aprovado', userId, startDate, endDate])
+  response.json({ data: { updated: result.affectedRows || 0 } })
 }))
 
 // Semana: retorna lançamentos por semana (startDate query)
